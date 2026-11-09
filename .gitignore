@@ -1,0 +1,13 @@
+*
+!/.gitattributes
+!/.gitignore
+!/LICENSE
+!/README.md
+!/README.en.md
+!/RELEASE-CHECK.md
+!/apply.mjs
+!/install.mjs
+!/patches/
+!/patches/native-vision.patch
+!/tests/
+!/tests/vision-native.test.mjs

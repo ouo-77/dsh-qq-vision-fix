@@ -1,0 +1,232 @@
+--- a/src/inbound.js
++++ b/src/inbound.js
+@@ -1,0 +2 @@
++import { joinContent, loadImages } from './native-images.js'
+@@ -533 +534 @@
+-export function createInbound({ config, manager, logger, client, send, approval, questions, contextGuard, wake, sleep, bridge, pin }) {
++export function createInbound({ config, manager, logger, client, send, approval, questions, contextGuard, wake, sleep, bridge, pin, getAttachments }) {
+@@ -551,4 +551,0 @@
+-    const message = createUserMessage({
+-      content: [{ type: 'text', text: body }],
+-      source: { kind: 'user' },
+-    })
+@@ -559,0 +557,9 @@
++        let content = body
++        if (body.some(block => block.type === 'image')) {
++          try { content = await getAttachments().admitPromptContent(body) }
++          catch {
++            await send(record, '本轮图片附件提交失败（数量、大小或附件服务限制），请分开发送。')
++            return
++          }
++        }
++        const message = createUserMessage({ content, source: { kind: 'user' } })
+@@ -594 +600 @@
+-  return async function onEvent(event) {
++  async function onEvent(event) {
+@@ -959 +965 @@
+-    let imagePaths = []
++    let images = []
+@@ -961,4 +967,8 @@
+-      await mkdir(cacheDir, { recursive: true }).catch(() => {})
+-      imagePaths = (await Promise.all(info.images.slice(0, 4).map((u) => downloadImage(u, cacheDir, maxMB)))).filter(Boolean)
+-      if (imagePaths.length > 0) pruneCache(cacheDir)
+-      else logger.warn?.(`[dsh-qq] 图片下载失败（${info.images.length} 张）`)
++      try {
++        images = await loadImages(info.images, getAttachments?.(), cacheDir, maxMB)
++        pruneCache(cacheDir)
++      } catch (err) {
++        const reason = err.code ? '缓存或附件服务出错' : err.message
++        await send(record, '图片未提交给模型：' + reason + '。请重新发送图片。')
++        return
++      }
+@@ -1058 +1068,16 @@
+-    if (head) parts.push(head)
++    let userBlocks
++    if (images.length) {
++      userBlocks = []
++      if (isGroup) userBlocks.push({ type: 'text', text: historyLine(sender, '', ownerInfo) })
++      let start = 0
++      const append = text => {
++        if (text) userBlocks.push({ type: 'text', text: isGroup ? sealBody(text) : text })
++      }
++      info.imageOffsets.forEach((offset, i) => {
++        append(info.text.slice(start, offset))
++        userBlocks.push(images[i])
++        start = offset + '[图片]'.length
++      })
++      append(info.text.slice(start))
++      parts.push(userBlocks)
++    } else if (head) parts.push(head)
+@@ -1077,6 +1102,2 @@
+-    if (imagePaths.length > 0) {
+-      parts.push(
+-        `[用户发了 ${imagePaths.length} 张图片，已存到本机，可以直接用 read_image 打开：]`,
+-        ...imagePaths.map((p) => `  ${p}`),
+-        IMAGE_RULES,
+-      )
++    if (images.length > 0) {
++      parts.push(IMAGE_RULES)
+@@ -1085,2 +1105,0 @@
+-    } else if (info.images.length > 0) {
+-      parts.push('[用户发了图片，但没能下载下来]')
+@@ -1204 +1223 @@
+-    const body = parts.join('\n')
++    const body = joinContent(parts)
+@@ -1229 +1248 @@
+-      sleep.hold(record, info.text || '[图片]')
++      sleep.hold(record, info.text || '[图片]', undefined, userBlocks)
+@@ -1252 +1271 @@
+-        runTurn({ ...batch.meta, body: batch.bodies.join('\n\n'), maxTurnMs })
++        runTurn({ ...batch.meta, body: joinContent(batch.bodies, '\n\n'), maxTurnMs })
+@@ -1259 +1278,10 @@
+-}
++  // Preserve private event arrival order even when an earlier download is slow.
++  const pending = new Map()
++  return event => {
++    if (event?.message_type !== 'private') return onEvent(event)
++    const key = String(event.user_id)
++    const task = (pending.get(key) || Promise.resolve()).catch(() => {}).then(() => onEvent(event))
++    pending.set(key, task)
++    return task.finally(() => { if (pending.get(key) === task) pending.delete(key) })
++  }
++}
+--- a/src/index.js
++++ b/src/index.js
+@@ -456 +456,7 @@
+-  const bedtime = createSleep({ config, manager, logger })
++  let attachments
++  ctx.inject?.(['attachments'], sub => {
++    attachments = sub.attachments
++    sub.on('dispose', () => { attachments = undefined })
++  })
++  const getAttachments = () => attachments
++  const bedtime = createSleep({ config, manager, logger, send, getAttachments })
+@@ -461 +467 @@
+-  const inbound = createInbound({ config, manager, logger, client, send, approval, questions, contextGuard, wake, sleep: bedtime, bridge, pin })
++  const inbound = createInbound({ config, manager, logger, client, send, approval, questions, contextGuard, wake, sleep: bedtime, bridge, pin, getAttachments })
+--- /dev/null
++++ b/src/native-images.js
+@@ -0,0 +1,78 @@
++import { randomUUID } from 'node:crypto'
++import { mkdir, writeFile } from 'node:fs/promises'
++import { join } from 'node:path'
++
++const cdns = new Set(['gchat.qpic.cn', 'c2cpicdw.qpic.cn', 'multimedia.nt.qq.com.cn', 'gchatpic_new.qq.com'])
++
++async function imageBytes(source, limit) {
++  if (typeof source !== 'string') throw Error('图片来源无效')
++  if (source.startsWith('base64://')) {
++    const encoded = source.slice(9)
++    if (encoded.length > Math.ceil(limit / 3) * 4) throw Error('图片超出大小限制')
++    const bytes = Buffer.from(encoded, 'base64')
++    if (!bytes.length || bytes.toString('base64') !== encoded) throw Error('图片 base64 编码损坏')
++    if (bytes.length > limit) throw Error('图片超出大小限制')
++    return bytes
++  }
++  let url
++  try { url = new URL(source) } catch { throw Error('缺少受信任的 QQ 图片地址') }
++  if (url.protocol !== 'https:' || !cdns.has(url.hostname) || url.port || url.username || url.password)
++    throw Error('图片来源不在 QQ CDN 白名单内')
++  const controller = new AbortController()
++  let response
++  try {
++    response = await fetch(url, { redirect: 'error', signal: AbortSignal.any([controller.signal, AbortSignal.timeout(20000)]) })
++    if (!response.ok || !response.body) throw Error('QQ CDN 下载失败')
++    if (Number(response.headers.get('content-length')) > limit) throw Error('图片超出大小限制')
++    const chunks = []
++    let size = 0
++    for await (const chunk of response.body) {
++      size += chunk.byteLength
++      if (size > limit) throw Error('图片超出大小限制')
++      chunks.push(chunk)
++    }
++    return Buffer.concat(chunks, size)
++  } finally { controller.abort() }
++}
++
++function imageType(bytes) {
++  if (bytes.subarray(0, 8).toString('hex') === '89504e470d0a1a0a') return 'png'
++  if (bytes.subarray(0, 3).toString('hex') === 'ffd8ff') return 'jpeg'
++  if (/^GIF8[79]a/.test(bytes.toString('ascii', 0, 6))) return 'gif'
++  if (bytes.toString('ascii', 0, 4) === 'RIFF' && bytes.toString('ascii', 8, 12) === 'WEBP') return 'webp'
++  throw Error('格式不支持或图片已损坏')
++}
++
++export async function loadImages(sources, store, dir, maxMB) {
++  if (!store?.saveImages) throw Error('DSH 图片附件服务不可用')
++  if (sources.length > Math.min(4, store.imageLimits.maxImagesPerMessage)) throw Error('图片数量超限')
++  const limit = Math.min(Math.max(1, maxMB) * 1048576, 8 * 1048576, store.imageLimits.maxImageBytes)
++  const inputs = []
++  let total = 0
++  for (const source of sources) {
++    const data = await imageBytes(source, limit)
++    total += data.length
++    if (total > store.imageLimits.maxMessageImageBytes) throw Error('图片总大小超限')
++    inputs.push({ data, mediaType: 'image/' + imageType(data) })
++  }
++  const refs = await store.saveImages(inputs).catch(() => { throw Error('DSH 校验或保存图片失败') })
++  await mkdir(dir, { recursive: true })
++  for (const { data, mediaType } of inputs) {
++    await writeFile(join(dir, 'qq-' + randomUUID() + '.' + mediaType.slice(6)), data, { flag: 'wx' })
++  }
++  return refs.map((attachment, i) => ({ type: 'image', attachment, encodedBytes: inputs[i].data.length }))
++}
++
++export function joinContent(parts, separator = '\n') {
++  const blocks = []
++  function add(block) {
++    if (block.type === 'text' && blocks.at(-1)?.type === 'text') blocks.at(-1).text += block.text
++    else blocks.push({ ...block })
++  }
++  parts.forEach((part, i) => {
++    if (i) add({ type: 'text', text: separator })
++    if (typeof part === 'string') add({ type: 'text', text: part })
++    else part.forEach(add)
++  })
++  return blocks
++}
+--- a/src/onebot/segment.js
++++ b/src/onebot/segment.js
+@@ -115,0 +116 @@
++  const imageOffsets = []
+@@ -149,0 +151 @@
++        imageOffsets.push(text.length)
+@@ -220,0 +223 @@
++    ...(images.length ? { imageOffsets: imageOffsets.map(offset => offset - (text.length - text.trimStart().length)) } : {}),
+--- a/src/prompts.js
++++ b/src/prompts.js
+@@ -163 +163 @@
+-export const IMAGE_RULES = `[图片规矩：先用 read_image 看一眼再说话，别瞎猜；看清楚了就顺着话回，不用描述得太细，也不要问「这是谁」。]`
++export const IMAGE_RULES = '[请依据本条消息中的图片回答；看不清的细节如实说明。]'
+--- a/src/sleep.js
++++ b/src/sleep.js
+@@ -67 +67 @@
+-export function createSleep({ config, manager, logger }) {
++export function createSleep({ config, manager, logger, send, getAttachments }) {
+@@ -120 +120 @@
+-  function hold(record, text, now = new Date()) {
++  function hold(record, text, now = new Date(), content) {
+@@ -126,0 +127 @@
++      ...(content ? { content } : {}),
+@@ -184 +185 @@
+-  function fire(record, text, tag) {
++  function fire(record, text, tag, items = []) {
+@@ -186,0 +188,12 @@
++        let content = [{ type: 'text', text }]
++        if (items.some(item => item.content)) {
++          try {
++            content = await getAttachments().admitPromptContent([
++              ...content,
++              ...items.flatMap(item => [{ type: 'text', text: '\n' + item.at + ' ' }, ...(item.content ?? [{ type: 'text', text: item.text }])]),
++            ])
++          } catch {
++            await send(record, '夜间消息中的图片未能提交给模型，请分开发送。')
++            return
++          }
++        }
+@@ -189 +202 @@
+-            content: [{ type: 'text', text }],
++            content,
+@@ -237 +250 @@
+-        fire(record, morningRule(config, { label: record.label, items, now }), '早安汇总')
++        fire(record, morningRule(config, { label: record.label, items, now }), '早安汇总', items)
